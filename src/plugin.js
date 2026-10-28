@@ -220,7 +220,10 @@ class Plugin {
           const response = await m.main(msg.params);
           await this._writeJsonrpcResponse(response, msg.id);
         } catch (error) {
-          await this._writeJsonrpcResponse({code: -32603, message: error.message}, msg.id, true);
+          // An error carrying a numeric code (one passed through from
+          // another JSON-RPC server, say) keeps it.
+          const code = Number.isInteger(error.code) ? error.code : -32603;
+          await this._writeJsonrpcResponse({code: code, message: error.message}, msg.id, true);
         }
       }
     });

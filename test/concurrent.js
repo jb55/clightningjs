@@ -14,6 +14,12 @@ const request = (id, value, delay) => JSON.stringify({
   jsonrpc: '2.0', id: id, method: 'echo', params: [value, delay],
 }) + '\n\n';
 
+// Two that fail: one with its own code, one without.
+const failure = (id, withCode) => JSON.stringify({
+  jsonrpc: '2.0', id: id, method: 'fail', params: [withCode],
+}) + '\n\n';
+child.stdin.write(failure('coded', true) + failure('uncoded', false));
+
 // Eight calls in one write, the first answering last.
 const ids = [...Array(8).keys()];
 child.stdin.write(ids.map((i) => request(i, 'value ' + i, 80 - i * 10)).join(''));
@@ -33,9 +39,9 @@ child.stdout.on('data', (chunk) => {
     const msg = JSON.parse(line);
     if (msg.method === 'log') continue;
     assert(!(msg.id in answers), 'answered twice: ' + msg.id);
-    answers[msg.id] = msg.result;
+    answers[msg.id] = msg.error || msg.result;
   }
-  if (Object.keys(answers).length === 9) finish();
+  if (Object.keys(answers).length === 11) finish();
 });
 
 const timer = setTimeout(() => {
@@ -47,5 +53,7 @@ function finish () {
   clearTimeout(timer);
   child.kill();
   for (const i of [...ids, 8]) assert.strictEqual(answers[i], 'value ' + i);
-  console.log('ok: 9 calls, each answered under its own id');
+  assert.deepStrictEqual(answers.coded, {code: -8, message: 'Block height out of range'});
+  assert.deepStrictEqual(answers.uncoded, {code: -32603, message: 'Block height out of range'});
+  console.log('ok: 11 calls, each answered under its own id, errors keeping their code');
 }
