@@ -16,6 +16,8 @@ class Plugin {
     // name: callback
     this.hooks = {};
     this.rpc = undefined;
+    // What stdin has sent past the last complete message
+    this._stdinBuffer = '';
     // Plugins are dynamic by default
     this.dynamic = true;
     if (typeof params != 'undefined') {
@@ -39,8 +41,8 @@ class Plugin {
     content += '\n';
     if (!process.stdout.write(content)) {
       return new Promise((resolve, reject) => {
-        process.stdout.once('drain', resolve());
-        process.stdout.once('error', reject());
+        process.stdout.once('drain', resolve);
+        process.stdout.once('error', reject);
       });
     }
     return Promise.resolve();
@@ -166,59 +168,69 @@ class Plugin {
     });
   }
 
+  // The complete messages stdin has sent so far, keeping the rest for the
+  // next read: a read can end partway through a message, and can hold
+  // several. lightningd ends each message with "\n\n".
+  _readMessages () {
+    let chunk;
+    while ((chunk = process.stdin.read()) !== null) {
+      this._stdinBuffer += chunk;
+    }
+    const parts = this._stdinBuffer.split('\n\n');
+    this._stdinBuffer = parts.pop();
+    return parts.filter((part) => part.trim());
+  }
+
+  // Answer one message. Everything it needs is in its own `msg`, so a
+  // method still running when the next message arrives answers under its
+  // own id.
+  async _handle (line) {
+    let msg;
+    try {
+      msg = JSON.parse(line);
+    } catch (e) {
+      this.log(e.message, 'error');
+      throw e;
+    }
+    // JSONRPC2 sanity checks
+    if (!msg || !msg.method || msg.jsonrpc !== '2.0') {
+      this.log('Got bad JSONRPC2', 'error');
+      throw new Error('Bad JSONRPC(2)!');
+    }
+    if (!msg.id && msg.method in this.notifications) {
+      this.notifications[msg.method].emit(msg.method, msg.params);
+    }
+    if (msg.method === 'getmanifest') {
+      await this._writeJsonrpcResponse(this._getmanifest(msg.params), msg.id);
+      return;
+    }
+    if (msg.method === 'init') {
+      await this._writeJsonrpcResponse(this._init(msg.params), msg.id);
+      return;
+    }
+    if (msg.method in this.hooks) {
+      Promise.resolve(this.hooks[msg.method](msg.params)).then(async (response) => {
+        await this._writeJsonrpcResponse(response, msg.id);
+      });
+      return;
+    }
+    this.methods.forEach(async (m) => {
+      if (m.name === msg.method) {
+        try {
+          const response = await m.main(msg.params);
+          await this._writeJsonrpcResponse(response, msg.id);
+        } catch (error) {
+          await this._writeJsonrpcResponse({code: -32603, message: error.message}, msg.id, true);
+        }
+      }
+    });
+  }
+
   // Read from stdin and do what master (not Satoshi, lightningd!!) tells until
   // we die
   async _mainLoop () {
-    let chunk;
-    let msg;
-    while (chunk = process.stdin.read()) {
-      // Ok so process.stdin.read() can actually return a chunk with multiple
-      // lines.
-      // FIXME: don't rely on lightningd's \n\n !!
-      const lines = chunk.split('\n\n');
-      for (const i in lines) {
-        if (!lines[i]) continue;
-        try {
-          msg = JSON.parse(lines[i]);
-        } catch (e) {
-          this.log(e.message, 'error');
-          throw e;
-        }
-        // JSONRPC2 sanity checks
-        if (!msg || !msg.method || msg.jsonrpc !== '2.0') {
-          this.log('Got bad JSONRPC2', 'error');
-          throw new Error('Bad JSONRPC(2)!');
-        }
-        if (!msg.id && msg.method in this.notifications) {
-          this.notifications[msg.method].emit(msg.method, msg.params);
-        }
-        if (msg.method === 'getmanifest') {
-          await this._writeJsonrpcResponse(this._getmanifest(msg.params),
-                                          msg.id);
-          continue;
-        }
-        if (msg.method === 'init') {
-          await this._writeJsonrpcResponse(this._init(msg.params),
-                                          msg.id);
-          continue;
-        }
-        if (msg.method in this.hooks) {
-          Promise.resolve(this.hooks[msg.method](msg.params)).then(async (response) => {
-            await this._writeJsonrpcResponse(response, msg.id);
-          });
-          continue;
-        }
-        this.methods.forEach(async (m) => {
-          if (m.name === msg.method) {
-            try {
-              const response = await m.main(msg.params)
-              await this._writeJsonrpcResponse(response, msg.id);
-            } catch (error) {
-              await this._writeJsonrpcResponse({code: -32603, message: error.message}, msg.id, true);
-            }
-          }
-        });
-      }
+    for (const line of this._readMessages()) {
+      await this._handle(line);
     }
   }
 
